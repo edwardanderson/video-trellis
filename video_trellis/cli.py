@@ -17,7 +17,6 @@ warnings.filterwarnings("ignore", message=".*bytes wanted but 0 bytes read.*")
 app = typer.Typer()
 
 
-
 def small_multiples(
     count: int,
     resolution: tuple[int, int],
@@ -73,7 +72,7 @@ def small_multiples(
     target_w, target_h = best_dims
     grid_w = cols * target_w
     grid_h = rows * target_h
-    
+
     if allow_padding:
         pad_x = (canvas_w - grid_w) // 2
         pad_y = (canvas_h - grid_h) // 2
@@ -82,7 +81,6 @@ def small_multiples(
         pad_y = 0
 
     return best_dims, best_layout, pad_x, pad_y
-
 
 
 @app.command()
@@ -120,6 +118,12 @@ def main(
         "-c/-nc",
         help="Remove interim scene clips after processing",
     ),
+    output: Path = typer.Option(
+        ...,
+        "--output",
+        "-o",
+        help="Path to output video file",
+    ),
 ):
     """
     Create a trellis chart visualisation from video scenes.
@@ -129,7 +133,11 @@ def main(
     print(f"Processing video: {video_file_path}")
     v = VideoFileClip(str(video_file_path))
     print(f"Video size: {v.size}")
-    
+
+    # Capture input video parameters
+    input_fps = v.fps
+    print(f"Input fps: {input_fps}")
+
     # Parse resolution or use video size
     if resolution:
         try:
@@ -143,17 +151,17 @@ def main(
     else:
         video_w, video_h = int(v.size[0]), int(v.size[1])
         target_resolution: tuple[int, int] = (video_w, video_h)
-    
+
     print(f"Target resolution: {target_resolution[0]}x{target_resolution[1]}")
-    
+
     # Detect scenes
     scene_list = detect(str(video_file_path), AdaptiveDetector())
     print(f"Detected {len(scene_list)} scenes")
-    
+
     if not scene_list:
         typer.echo("Error: No scenes detected in video", err=True)
         raise typer.Exit(1)
-    
+
     # Calculate optimal grid layout and clip dimensions
     (target_dims, layout, pad_x, pad_y) = small_multiples(
         count=len(scene_list),
@@ -164,12 +172,12 @@ def main(
     rows, cols = layout
     print(f"Target clip dimensions: {target_dims}")
     print(f"Grid layout: {rows} rows x {cols} cols")
-    
+
     # Split video into scene clips
     output_dir = video_file_path.parent / 'scenes'
     output_dir.mkdir(exist_ok=True)
     split_video_ffmpeg(str(video_file_path), scene_list, output_file_template=str(output_dir / '$SCENE_NUMBER.mp4'))
-    
+
     # Load and downscale each scene clip
     downscaled_clips = []
     for i in range(len(scene_list)):
@@ -181,14 +189,14 @@ def main(
             downscaled_clips.append(clip)
         else:
             print(f"Warning: Scene file {scene_file} not found")
-    
+
     print(f"Loaded and downscaled {len(downscaled_clips)} clips")
-    
+
     # Optionally loop clips to match the longest clip duration
     if loop_clips and downscaled_clips:
         max_duration = max(clip.duration for clip in downscaled_clips)
         print(f"Longest clip duration: {max_duration:.2f}s")
-        
+
         looped_clips = []
         for clip in downscaled_clips:
             if clip.duration < max_duration:
@@ -196,38 +204,37 @@ def main(
                 clip = clip.with_effects([Loop(duration=max_duration)])
             looped_clips.append(clip)
         downscaled_clips = looped_clips
-    
+
     # Create grid layout with packed rectangles
     target_w, target_h = target_dims
     canvas_w, canvas_h = target_resolution
-    
+
     positioned_clips = []
     for idx, clip in enumerate(downscaled_clips):
         row = idx // cols
         col = idx % cols
-        
+
         # Calculate position in grid with padding
         x = pad_x + col * target_w
         y = pad_y + row * target_h
-        
+
         # Position the clip
         positioned_clip = clip.with_position((x, y))
         positioned_clips.append(positioned_clip)
-    
+
     # Composite all clips into a single video
     final_clip = CompositeVideoClip(positioned_clips, size=(canvas_w, canvas_h))
-    
-    # Write output
-    output_path = video_file_path.parent / f'{video_file_path.stem}_trellis.mp4'
-    print(f"Writing output to: {output_path}")
-    final_clip.write_videofile(str(output_path), codec='libx264', fps=24, audio=False)
-    
+
+    # Write output using input video parameters
+    print(f"Writing output to: {output}")
+    final_clip.write_videofile(str(output), codec='libx264', fps=input_fps, audio=False)
+
     # Cleanup
     v.close()
     for clip in downscaled_clips:
         clip.close()
     final_clip.close()
-    
+
     # Remove interim scene clips if requested
     if cleanup:
         import shutil
@@ -236,7 +243,6 @@ def main(
         print("Scene files removed.")
     
     print("Done!")
-
 
 
 if __name__ == "__main__":

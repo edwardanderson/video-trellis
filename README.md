@@ -10,6 +10,6 @@ G. B. Instructional. (1950). Colour in Clay. British Council. https://film.briti
 
 ## CLI
 
-```
-video-trellis --input path/to/file --loop-clips --resolution 2048x1080
+```bash
+video-trellis --input path/to/file --loop-clips --resolution 2048x1080 --output path/to/outfile
 ```
