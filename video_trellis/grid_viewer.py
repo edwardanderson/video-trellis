@@ -2113,6 +2113,7 @@ class GridViewer:
         visible_hires_requests: List[Tuple[int, int, Tuple[int, int]]] = []
         visible_shot_indices: List[int] = []
         visible_shot_weights: Dict[int, int] = {}
+        subtitle_candidates: List[Tuple[int, float, int, int, int, int]] = []
         viewport_pixels = max(1, self.window_width * self.window_height)
         
         # Render each shot with culling (skip off-screen cells)
@@ -2199,12 +2200,16 @@ class GridViewer:
                     )
                 if self.subtitles and self.subtitles_visible and self.grid_zoom >= self.subtitle_zoom_threshold:
                     abs_ts = start_time + time_in_shot
-                    sub_text = self._subtitle_at(abs_ts)
-                    if sub_text:
-                        self._render_subtitle_on_tile(surface, sub_text, draw_x, draw_y, draw_w, draw_h)
+                    subtitle_candidates.append((visible_pixels, abs_ts, draw_x, draw_y, draw_w, draw_h))
             except Exception as e:
                 # Silently skip if blit fails
                 pass
+
+        if subtitle_candidates:
+            for _visible_pixels, abs_ts, draw_x, draw_y, draw_w, draw_h in subtitle_candidates:
+                sub_text = self._subtitle_at(abs_ts)
+                if sub_text:
+                    self._render_subtitle_on_tile(surface, sub_text, draw_x, draw_y, draw_w, draw_h)
 
         with self._cache_lock:
             self._visible_hires_requests = visible_hires_requests
