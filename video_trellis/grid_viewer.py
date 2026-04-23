@@ -988,9 +988,11 @@ class GridViewer:
         self.hires_fullres_viewport_threshold = 0.80
         self.hires_cache_prune_zoom_ratio = 2.0
         self.hires_prefetch_budget_per_cycle = 8
+        self.hires_prefetch_budget_max_boosted = 16
         # Keep the base cache coarse for RAM efficiency, but let zoomed playback track source FPS.
         self.hires_time_quantum = hires_target_quantum
         self.hires_prefetch_max_lead_frames = 8
+        self.hires_nearest_fallback_radius = 3
         self.hires_prefetch_cursor = 0
         self._visible_hires_requests: List[Tuple[int, int, Tuple[int, int]]] = []
         self._visible_shot_indices: List[int] = []
@@ -1458,8 +1460,6 @@ class GridViewer:
                     with self._cache_lock:
                         hires_requests = list(self._visible_hires_requests)
                         visible_weights = dict(self._visible_shot_weights)
-                    # Bound HQ work tightly to currently visible demand.
-                    hires_budget = min(8, max(2, min(max(hires_budget, len(hires_requests)), len(hires_requests) + 1)))
                     if hires_requests:
                         ordered = sorted(
                             hires_requests,
@@ -1475,6 +1475,7 @@ class GridViewer:
                             seen_reqs.add(req)
                             deduped.append(req)
                         ordered = deduped
+                        hires_budget = self._hires_budget_for_visibility(len(ordered), visible_weights)
                     else:
                         ordered = []
 
@@ -1573,6 +1574,32 @@ class GridViewer:
         with self._cache_lock:
             return self.hires_frame_buffer.get(shot_idx, {}).get((frame_idx, size_key))
 
+    def _get_nearest_cached_hires_frame(
+        self,
+        shot_idx: int,
+        frame_idx: int,
+        target_dims: Tuple[int, int],
+        bucket_count: int,
+    ) -> Optional[np.ndarray]:
+        """Return adjacent cached hi-res frame before dropping to base-res fallback."""
+        if bucket_count <= 0 or self.hires_nearest_fallback_radius <= 0:
+            return None
+
+        size_key = self._size_key_for_dims(target_dims)
+        with self._cache_lock:
+            by_shot = self.hires_frame_buffer.get(shot_idx, {})
+            for radius in range(1, self.hires_nearest_fallback_radius + 1):
+                prev_idx = (frame_idx - radius) % bucket_count
+                frame = by_shot.get((prev_idx, size_key))
+                if frame is not None:
+                    return frame
+
+                next_idx = (frame_idx + radius) % bucket_count
+                frame = by_shot.get((next_idx, size_key))
+                if frame is not None:
+                    return frame
+        return None
+
     def _effective_hires_dims(self, draw_x: int, draw_y: int, draw_w: int, draw_h: int) -> Tuple[int, int]:
         """Clamp zoom decode dimensions with viewport-proportional quality limits."""
         # Target on-screen size with a small overscan so downscaling looks sharper.
@@ -1630,6 +1657,57 @@ class GridViewer:
         if coverage >= 0.25:
             return min(self.hires_prefetch_max_lead_frames, 4)
         return min(self.hires_prefetch_max_lead_frames, 2)
+
+    def _hires_budget_for_visibility(self, request_count: int, visible_weights: Dict[int, int]) -> int:
+        """Dynamically raise hi-res budget when one tile dominates the viewport.
+
+        The boost is a continuous multiplicative function of three factors:
+          - dominant_coverage  : how much of the viewport the largest tile occupies
+          - headroom_factor    : fraction of per-frame render budget still available
+          - pressure_factor    : 1 minus the fraction of frame budget spent on decoding
+
+        This means the boost scales down smoothly as the system gets busier, rather
+        than jumping between fixed subtract thresholds.
+        """
+        if request_count <= 0:
+            return 0
+
+        viewport_pixels = max(1, self.window_width * self.window_height)
+        dominant_pixels = max(visible_weights.values(), default=0)
+        dominant_coverage = dominant_pixels / float(viewport_pixels)
+
+        # Coverage-based base boost (kick in at 60%).
+        if dominant_coverage >= 0.85:
+            base_boost = 8
+        elif dominant_coverage >= 0.72:
+            base_boost = 6
+        elif dominant_coverage >= 0.60:
+            base_boost = 3
+        else:
+            base_boost = 0
+
+        target_frame_ms = 1000.0 / max(float(self.fps), 1.0)
+
+        # Render-headroom factor: how much of the frame budget is still free.
+        render_samples = list(self.render_times)[-20:]
+        avg_render_ms = sum(render_samples) / len(render_samples) if render_samples else 0.0
+        headroom_factor = max(0.0, min(1.0, (target_frame_ms - avg_render_ms) / target_frame_ms))
+
+        # Decode-pressure factor: high decode load reduces willingness to queue more.
+        decode_samples = list(self.decode_times)[-20:]
+        avg_decode_ms = sum(decode_samples) / len(decode_samples) if decode_samples else 0.0
+        pressure_factor = max(0.0, min(1.0, 1.0 - (avg_decode_ms / max(target_frame_ms, 1.0))))
+
+        final_boost = int(base_boost * headroom_factor * pressure_factor)
+        # Guarantee at least a token boost of 1 when we are in the coverage zone,
+        # so we do not stall hi-res prefetch entirely during a brief spike.
+        if dominant_coverage >= 0.60 and final_boost == 0:
+            final_boost = 1
+
+        budget = self.hires_prefetch_budget_per_cycle + final_boost
+        budget = min(self.hires_prefetch_budget_max_boosted, budget)
+        budget = min(request_count, budget)
+        return max(1, budget)
 
     def _prune_invisible_caches(self, visible_shot_indices: List[int]) -> None:
         """Drop off-screen hi-res caches so zoomed-in playback prioritizes visible content."""
@@ -1696,11 +1774,23 @@ class GridViewer:
         # Zoomed-in path: use cached hi-res frame if available.
         if target_dims[0] > self.cell_dims[0] or target_dims[1] > self.cell_dims[1]:
             hires_frame_idx = self._frame_idx_for_quantum(shot_idx, time_offset, self.hires_time_quantum)
+            hires_bucket_count = max(1, int(shot_duration / self.hires_time_quantum) + 1)
             frame = self._get_cached_hires_frame(shot_idx, hires_frame_idx, target_dims)
             if frame is not None:
                 self.cache_hits += 1
                 self.shot_stats["exact_hits"][shot_idx] += 1
                 self.shot_stats["exact_hit_frames"][shot_idx].append(frame_count)
+                self._record_shot_lag(shot_idx, frame_idx, frame_idx)
+                return frame
+            frame = self._get_nearest_cached_hires_frame(
+                shot_idx,
+                hires_frame_idx,
+                target_dims,
+                hires_bucket_count,
+            )
+            if frame is not None:
+                self.cache_fallback_reuses += 1
+                self.shot_stats["fallback_hits"][shot_idx] += 1
                 self._record_shot_lag(shot_idx, frame_idx, frame_idx)
                 return frame
         
