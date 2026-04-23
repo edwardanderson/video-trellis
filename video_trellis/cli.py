@@ -586,6 +586,12 @@ def view_grid_cmd(
         "-p/-np",
         help="Preserve aspect ratio with padding",
     ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Enable verbose logging for cache, warmup, and performance diagnostics",
+    ),
 ):
     """
     View video shots in an interactive grid without re-encoding.
@@ -609,9 +615,11 @@ def view_grid_cmd(
                 fps=fps,
                 allow_padding=padding,
                 fullscreen=fullscreen,
+                verbose=verbose,
             )
         else:
-            print(f"No manifest provided; detecting scenes in-memory: {video_file}")
+            if verbose:
+                print(f"No manifest provided; detecting scenes in-memory: {video_file}")
             scene_list = detect(str(video_file), AdaptiveDetector(), show_progress=True)
             if not scene_list:
                 raise ValueError("No scenes detected in input video")
@@ -620,7 +628,8 @@ def view_grid_cmd(
                 (start_time.get_seconds(), end_time.get_seconds())
                 for start_time, end_time in scene_list
             ]
-            print(f"Detected {len(shot_timecodes)} shots from input video")
+            if verbose:
+                print(f"Detected {len(shot_timecodes)} shots from input video")
 
             view_grid(
                 video_file,
@@ -630,6 +639,7 @@ def view_grid_cmd(
                 fps=fps,
                 allow_padding=padding,
                 fullscreen=fullscreen,
+                verbose=verbose,
             )
     except Exception as e:
         typer.echo(f"Error: {e}", err=True)
