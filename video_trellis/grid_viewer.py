@@ -5,10 +5,12 @@ This module provides dynamic, GPU-accelerated viewing of video shots
 arranged in a grid without requiring re-encoding.
 """
 
+import bisect
 import csv
 import json
 import math
 import os
+import re
 import tempfile
 import time
 import threading
@@ -29,6 +31,46 @@ try:
 except ImportError:
     cv2 = None
     HAS_CV2 = False
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def parse_srt(srt_path: Path) -> List[Tuple[float, float, str]]:
+    """Parse a SubRip (.srt) file into a sorted list of (start_sec, end_sec, text) tuples.
+
+    HTML tags such as <i> and <b> are stripped.  Entries are returned sorted by
+    start time so binary search can be used at render time.
+    """
+    def _srt_ts_to_sec(ts: str) -> float:
+        # Format: HH:MM:SS,mmm
+        ts = ts.replace(",", ".")
+        parts = ts.split(":")
+        h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
+        return h * 3600 + m * 60 + s
+
+    entries: List[Tuple[float, float, str]] = []
+    text = srt_path.read_text(encoding="utf-8-sig", errors="replace")
+    blocks = re.split(r"\n\s*\n", text.strip())
+    for block in blocks:
+        lines = block.strip().splitlines()
+        # Find the timecode line (contains " --> ")
+        tc_idx = next((i for i, l in enumerate(lines) if " --> " in l), None)
+        if tc_idx is None:
+            continue
+        tc_line = lines[tc_idx]
+        arrow_pos = tc_line.index(" --> ")
+        try:
+            start = _srt_ts_to_sec(tc_line[:arrow_pos].strip())
+            end = _srt_ts_to_sec(tc_line[arrow_pos + 5:].strip().split()[0])
+        except (ValueError, IndexError):
+            continue
+        raw_text = "\n".join(lines[tc_idx + 1:]).strip()
+        clean_text = _HTML_TAG_RE.sub("", raw_text).strip()
+        if clean_text:
+            entries.append((start, end, clean_text))
+
+    entries.sort(key=lambda e: e[0])
+    return entries
 
 
 def timecode_to_seconds(timecode: str) -> float:
@@ -881,6 +923,7 @@ class GridViewer:
         allow_padding: bool = True,
         fullscreen: bool = False,
         verbose: bool = False,
+        subtitle_path: Optional[Path] = None,
     ):
         """
         Initialize the grid viewer.
@@ -909,8 +952,21 @@ class GridViewer:
         self.allow_padding = allow_padding
         self.fullscreen = fullscreen
         self.verbose = verbose
-        
-        # Load video
+
+        # Subtitle support
+        if subtitle_path is not None:
+            self.subtitles: List[Tuple[float, float, str]] = parse_srt(subtitle_path)
+        else:
+            self.subtitles = []
+        self._subtitle_starts: List[float] = [s for s, _e, _t in self.subtitles]
+        # Zoom level at which subtitles become visible (tiles must be large enough to read text).
+        self.subtitle_zoom_threshold: float = 1.5
+        # Font cache keyed by pixel size, populated lazily during rendering.
+        self._subtitle_font_cache: Dict[int, pygame.font.Font] = {}
+        # Caption layout cache: (text, draw_w, draw_h, font_size) -> pre-rendered overlay surface.
+        self._subtitle_overlay_cache: Dict[Tuple[str, int, int, int], pygame.Surface] = {}
+        self._subtitle_overlay_cache_max_entries: int = 512
+        self.subtitles_visible: bool = True
         self.video = VideoFileClip(str(video_path), audio=False)
         self.video_width = int(self.video.w)
         self.video_height = int(self.video.h)
@@ -1658,6 +1714,92 @@ class GridViewer:
             return min(self.hires_prefetch_max_lead_frames, 4)
         return min(self.hires_prefetch_max_lead_frames, 2)
 
+    def _subtitle_at(self, abs_ts: float) -> Optional[str]:
+        """Return the subtitle text active at *abs_ts* seconds, or None."""
+        if not self.subtitles:
+            return None
+        idx = bisect.bisect_right(self._subtitle_starts, abs_ts) - 1
+        if idx < 0:
+            return None
+        start, end, text = self.subtitles[idx]
+        return text if abs_ts <= end else None
+
+    def _get_subtitle_font(self, size: int) -> pygame.font.Font:
+        if size not in self._subtitle_font_cache:
+            self._subtitle_font_cache[size] = pygame.font.Font(None, size)
+        return self._subtitle_font_cache[size]
+
+    def _render_subtitle_on_tile(
+        self,
+        surface: pygame.Surface,
+        text: str,
+        draw_x: int,
+        draw_y: int,
+        draw_w: int,
+        draw_h: int,
+    ) -> None:
+        """Overlay subtitle text as a caption box at the bottom of a tile."""
+        visible_tile_h = max(1, min(draw_h, self.window_height))
+        zoom_scale = max(1.0, self.grid_zoom / max(self.subtitle_zoom_threshold, 0.1))
+        font_size = int(visible_tile_h * 0.065 * min(2.0, zoom_scale))
+        font_size = max(18, min(72, font_size))
+        cache_key = (text, draw_w, draw_h, font_size)
+        overlay = self._subtitle_overlay_cache.get(cache_key)
+        if overlay is not None:
+            overlay_y = draw_y + draw_h - overlay.get_height() - max(3, draw_h // 40)
+            overlay_y = max(draw_y, overlay_y)
+            surface.blit(overlay, (draw_x, overlay_y))
+            return
+
+        font = self._get_subtitle_font(font_size)
+        h_pad = max(4, draw_w // 24)
+        v_pad = max(3, draw_h // 40)
+        max_line_w = draw_w - h_pad * 2
+
+        # Word-wrap each raw line independently.
+        wrapped: List[str] = []
+        for raw_line in text.split("\n"):
+            words = raw_line.split()
+            if not words:
+                wrapped.append("")
+                continue
+            current: List[str] = []
+            for word in words:
+                candidate = " ".join(current + [word])
+                if font.size(candidate)[0] <= max_line_w:
+                    current.append(word)
+                else:
+                    if current:
+                        wrapped.append(" ".join(current))
+                    current = [word]
+            if current:
+                wrapped.append(" ".join(current))
+
+        if not wrapped:
+            return
+
+        line_h = font.get_linesize()
+        total_text_h = line_h * len(wrapped)
+        box_h = total_text_h + v_pad * 2
+        overlay = pygame.Surface((draw_w, box_h), pygame.SRCALPHA)
+        bg = pygame.Surface((draw_w - h_pad * 2, box_h), pygame.SRCALPHA)
+        bg.fill((0, 0, 0, 160))
+        overlay.blit(bg, (h_pad, 0))
+
+        for i, line in enumerate(wrapped):
+            text_surf = font.render(line, True, (255, 255, 255))
+            tx = h_pad + (draw_w - h_pad * 2 - text_surf.get_width()) // 2
+            ty = v_pad + i * line_h
+            overlay.blit(text_surf, (tx, ty))
+
+        if len(self._subtitle_overlay_cache) >= self._subtitle_overlay_cache_max_entries:
+            self._subtitle_overlay_cache.pop(next(iter(self._subtitle_overlay_cache)))
+        self._subtitle_overlay_cache[cache_key] = overlay
+
+        overlay_y = draw_y + draw_h - overlay.get_height() - v_pad
+        overlay_y = max(draw_y, overlay_y)
+        surface.blit(overlay, (draw_x, overlay_y))
+
     def _hires_budget_for_visibility(self, request_count: int, visible_weights: Dict[int, int]) -> int:
         """Dynamically raise hi-res budget when one tile dominates the viewport.
 
@@ -2055,6 +2197,11 @@ class GridViewer:
                             badge_rect.y + (badge_rect.height - badge_text.get_height()) // 2,
                         ),
                     )
+                if self.subtitles and self.subtitles_visible and self.grid_zoom >= self.subtitle_zoom_threshold:
+                    abs_ts = start_time + time_in_shot
+                    sub_text = self._subtitle_at(abs_ts)
+                    if sub_text:
+                        self._render_subtitle_on_tile(surface, sub_text, draw_x, draw_y, draw_w, draw_h)
             except Exception as e:
                 # Silently skip if blit fails
                 pass
@@ -2242,6 +2389,10 @@ class GridViewer:
                             self._open_shot_viewer(sv.shot_idx - 1)
                         elif event.key == pygame.K_RIGHT and sv.shot_idx < sv.total_shots - 1:
                             self._open_shot_viewer(sv.shot_idx + 1)
+                    elif event.key == pygame.K_s:
+                        self.subtitles_visible = not self.subtitles_visible
+                    elif event.key == pygame.K_BACKSPACE:
+                        self.selected_shot_indices.clear()
                     elif event.key == pygame.K_SPACE:
                         self.playing = not self.playing
                     elif event.key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
@@ -2590,7 +2741,7 @@ class GridViewer:
         selected_text = str(len(self.selected_shot_indices))
         zoom_text = f"{self.grid_zoom:.2f}x"
         text = font.render(
-            f"{status} | {self.current_time:.1f}s / {self.max_duration:.1f}s | Hover: {hover_text} | Selected: {selected_text} | Zoom: {zoom_text} | Q=quit SPACE=pause",
+            f"{status} | {self.current_time:.1f}s / {self.max_duration:.1f}s | Hover: {hover_text} | Selected: {selected_text} | Zoom: {zoom_text} | Q=quit SPACE=pause BACKSPACE=clear",
             True,
             (255, 255, 255)
         )
@@ -2607,6 +2758,7 @@ def view_grid(
     allow_padding: bool = True,
     fullscreen: bool = False,
     verbose: bool = False,
+    subtitle_path: Optional[Path] = None,
 ) -> None:
     """
     Open an interactive grid viewer for video shots from a manifest.
@@ -2662,6 +2814,7 @@ def view_grid(
         allow_padding=allow_padding,
         fullscreen=fullscreen,
         verbose=verbose,
+        subtitle_path=subtitle_path,
     )
     
     viewer.run()

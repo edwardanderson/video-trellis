@@ -592,6 +592,14 @@ def view_grid_cmd(
         "-v",
         help="Enable verbose logging for cache, warmup, and performance diagnostics",
     ),
+    srt: Optional[Path] = typer.Option(
+        None,
+        "--srt",
+        help="Optional path to a SubRip (.srt) subtitle file. Subtitles are shown on tiles above a zoom threshold.",
+        exists=True,
+        dir_okay=False,
+        resolve_path=True,
+    ),
 ):
     """
     View video shots in an interactive grid without re-encoding.
@@ -616,6 +624,7 @@ def view_grid_cmd(
                 allow_padding=padding,
                 fullscreen=fullscreen,
                 verbose=verbose,
+                subtitle_path=srt,
             )
         else:
             if verbose:
@@ -640,6 +649,7 @@ def view_grid_cmd(
                 allow_padding=padding,
                 fullscreen=fullscreen,
                 verbose=verbose,
+                subtitle_path=srt,
             )
     except Exception as e:
         typer.echo(f"Error: {e}", err=True)
