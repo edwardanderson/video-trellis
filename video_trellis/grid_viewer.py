@@ -11,16 +11,18 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 import time
 import threading
 from pathlib import Path
-from typing import Optional, List, Tuple, Dict, cast
+from typing import Optional, List, Tuple, Dict, Callable, cast
 from collections import deque
 
 import pygame
 import numpy as np
-from moviepy import VideoFileClip
+from moviepy import VideoFileClip, concatenate_videoclips
 from PIL import Image
 
 RESAMPLE_BILINEAR = Image.Resampling.BILINEAR
@@ -1036,19 +1038,21 @@ class GridViewer:
         self.hires_frame_buffer: Dict[int, Dict[Tuple[int, int], np.ndarray]] = {}
         self.hires_frame_read_order: Dict[int, deque[Tuple[int, int]]] = {}
         hires_target_quantum = min(self.cache_time_quantum, 1.0 / max(float(self.fps), 1.0))
-        self.hires_frame_buffer_max_per_shot = max(60, int(math.ceil(3.0 / hires_target_quantum)))
+        self.hires_frame_buffer_max_per_shot = max(120, int(math.ceil(6.0 / hires_target_quantum)))
         # Hi-res decode is background-only to keep the UI thread responsive.
         self.hires_decode_enabled_zoom = 1.25
         self.hires_decode_overscan = 1.35
         self.hires_decode_max_pixels = 3_145_728  # ~2048x1536 max per visible tile
         self.hires_fullres_viewport_threshold = 0.80
         self.hires_cache_prune_zoom_ratio = 2.0
-        self.hires_prefetch_budget_per_cycle = 8
-        self.hires_prefetch_budget_max_boosted = 16
+        self.hires_prefetch_budget_per_cycle = 18
+        self.hires_prefetch_budget_max_boosted = 40
+        self.hires_cursor_hint_lead_frames = 5
+        self.hires_cursor_hint_weight_boost = 0.55
         # Keep the base cache coarse for RAM efficiency, but let zoomed playback track source FPS.
         self.hires_time_quantum = hires_target_quantum
-        self.hires_prefetch_max_lead_frames = 8
-        self.hires_nearest_fallback_radius = 3
+        self.hires_prefetch_max_lead_frames = 16
+        self.hires_nearest_fallback_radius = 6
         self.hires_prefetch_cursor = 0
         self._visible_hires_requests: List[Tuple[int, int, Tuple[int, int]]] = []
         self._visible_shot_indices: List[int] = []
@@ -1104,6 +1108,9 @@ class GridViewer:
         self._shot_viewer: Optional[ShotViewer] = None
         self._sequence_viewer: Optional[SequenceViewer] = None
         self.selected_shot_indices: List[int] = []
+        self._export_thread: Optional[threading.Thread] = None
+        self._export_status_lock = threading.Lock()
+        self._export_status: str = ""
 
         # Grid zoom state (applies only to the background shot grid).
         self.grid_zoom = 1.0
@@ -1512,7 +1519,7 @@ class GridViewer:
 
                 hires_budget = self.hires_prefetch_budget_per_cycle
                 decoded_hires = 0
-                if hires_budget > 0 and self.grid_zoom >= self.hires_decode_enabled_zoom:
+                if hires_budget > 0:
                     with self._cache_lock:
                         hires_requests = list(self._visible_hires_requests)
                         visible_weights = dict(self._visible_shot_weights)
@@ -1531,7 +1538,16 @@ class GridViewer:
                             seen_reqs.add(req)
                             deduped.append(req)
                         ordered = deduped
-                        hires_budget = self._hires_budget_for_visibility(len(ordered), visible_weights)
+                        if self.grid_zoom >= self.hires_decode_enabled_zoom:
+                            hires_budget = self._hires_budget_for_visibility(len(ordered), visible_weights)
+                            visible_count = max(1, len(visible_weights))
+                            if visible_count <= 2:
+                                hires_budget = min(len(ordered), max(hires_budget, 24))
+                            elif visible_count <= 4:
+                                hires_budget = min(len(ordered), max(hires_budget, 16))
+                        else:
+                            # Cursor hint mode: keep pre-decode cheap before full zoom.
+                            hires_budget = min(2, len(ordered))
                     else:
                         ordered = []
 
@@ -1576,6 +1592,12 @@ class GridViewer:
         qw = max(1, int(round(w / 16.0)) * 16)
         qh = max(1, int(round(h / 16.0)) * 16)
         return (qw << 16) | qh
+
+    def _dims_for_size_key(self, size_key: int) -> Tuple[int, int]:
+        """Decode packed size key back to quantized width/height."""
+        qw = (size_key >> 16) & 0xFFFF
+        qh = size_key & 0xFFFF
+        return max(1, qw), max(1, qh)
 
     def _decode_hires_frame(
         self,
@@ -1629,6 +1651,49 @@ class GridViewer:
         size_key = self._size_key_for_dims(target_dims)
         with self._cache_lock:
             return self.hires_frame_buffer.get(shot_idx, {}).get((frame_idx, size_key))
+
+    def _get_compatible_cached_hires_frame(
+        self,
+        shot_idx: int,
+        frame_idx: int,
+        target_dims: Tuple[int, int],
+    ) -> Optional[np.ndarray]:
+        """Return same-frame cached hi-res from a nearby size tier if exact tier is missing.
+
+        Preference order:
+          1) Smallest cached tier that is >= requested dims (best for zooming out slightly)
+          2) Largest available tier below requested dims
+        """
+        target_w, target_h = target_dims
+        with self._cache_lock:
+            by_shot = self.hires_frame_buffer.get(shot_idx, {})
+            same_frame_entries = [
+                (size_key, frame)
+                for (cached_frame_idx, size_key), frame in by_shot.items()
+                if cached_frame_idx == frame_idx
+            ]
+
+        if not same_frame_entries:
+            return None
+
+        candidates_ge = []
+        candidates_lt = []
+        for size_key, frame in same_frame_entries:
+            w, h = self._dims_for_size_key(size_key)
+            area = w * h
+            if w >= target_w and h >= target_h:
+                over_area = area - (target_w * target_h)
+                candidates_ge.append((over_area, area, frame))
+            else:
+                candidates_lt.append((area, frame))
+
+        if candidates_ge:
+            candidates_ge.sort(key=lambda item: (item[0], item[1]))
+            return candidates_ge[0][2]
+
+        # If no tier is large enough, use the largest available tier.
+        candidates_lt.sort(key=lambda item: item[0], reverse=True)
+        return candidates_lt[0][1] if candidates_lt else None
 
     def _get_nearest_cached_hires_frame(
         self,
@@ -1840,7 +1905,22 @@ class GridViewer:
         avg_decode_ms = sum(decode_samples) / len(decode_samples) if decode_samples else 0.0
         pressure_factor = max(0.0, min(1.0, 1.0 - (avg_decode_ms / max(target_frame_ms, 1.0))))
 
+        # When only a handful of tiles are visible, spend more decode budget to
+        # replace low-res placeholders quickly.
+        visible_count = max(1, len(visible_weights))
+        if visible_count <= 2:
+            small_set_boost = 18
+        elif visible_count <= 4:
+            small_set_boost = 12
+        elif visible_count <= 6:
+            small_set_boost = 6
+        else:
+            small_set_boost = 0
+
         final_boost = int(base_boost * headroom_factor * pressure_factor)
+        if small_set_boost > 0:
+            small_set_factor = (0.45 + 0.55 * headroom_factor) * max(0.35, pressure_factor)
+            final_boost += int(small_set_boost * small_set_factor)
         # Guarantee at least a token boost of 1 when we are in the coverage zone,
         # so we do not stall hi-res prefetch entirely during a brief spike.
         if dominant_coverage >= 0.60 and final_boost == 0:
@@ -1866,8 +1946,9 @@ class GridViewer:
 
     def _maybe_prune_hires_cache_for_zoom(self, old_zoom: float, new_zoom: float) -> None:
         """Prune hi-res cache when zoom tier changes enough to invalidate cached size buckets."""
+        # Keep hi-res cache when dipping below threshold so rapid zoom-in/out
+        # does not drop back to lowest-quality placeholders.
         if new_zoom < self.hires_decode_enabled_zoom:
-            self._clear_hires_cache()
             return
         if old_zoom <= 0:
             return
@@ -1922,6 +2003,12 @@ class GridViewer:
                 self.cache_hits += 1
                 self.shot_stats["exact_hits"][shot_idx] += 1
                 self.shot_stats["exact_hit_frames"][shot_idx].append(frame_count)
+                self._record_shot_lag(shot_idx, frame_idx, frame_idx)
+                return frame
+            frame = self._get_compatible_cached_hires_frame(shot_idx, hires_frame_idx, target_dims)
+            if frame is not None:
+                self.cache_fallback_reuses += 1
+                self.shot_stats["fallback_hits"][shot_idx] += 1
                 self._record_shot_lag(shot_idx, frame_idx, frame_idx)
                 return frame
             frame = self._get_nearest_cached_hires_frame(
@@ -2115,6 +2202,7 @@ class GridViewer:
         visible_shot_weights: Dict[int, int] = {}
         subtitle_candidates: List[Tuple[int, float, int, int, int, int]] = []
         viewport_pixels = max(1, self.window_width * self.window_height)
+        hovered_shot_idx = self._hovered_shot_index()
         
         # Render each shot with culling (skip off-screen cells)
         for shot_idx, (start_time, end_time) in enumerate(self.shot_timecodes):
@@ -2149,7 +2237,11 @@ class GridViewer:
             visible_pixels = max(0, vis_x1 - vis_x0) * max(0, vis_y1 - vis_y0)
 
             visible_shot_indices.append(shot_idx)
-            visible_shot_weights[shot_idx] = visible_pixels
+            weight = visible_pixels
+            if hovered_shot_idx is not None and shot_idx == hovered_shot_idx:
+                # Cursor-hovered shot gets priority so upcoming zoom has warm hi-res cache.
+                weight += int(viewport_pixels * self.hires_cursor_hint_weight_boost)
+            visible_shot_weights[shot_idx] = weight
             
             # Calculate playback position within this shot (looping)
             # Each shot loops independently as global time advances
@@ -2166,6 +2258,19 @@ class GridViewer:
                     for offset in range(lead_depth):
                         req_idx = (hires_frame_idx + offset) % hires_bucket_count
                         visible_hires_requests.append((shot_idx, req_idx, target_dims))
+            elif hovered_shot_idx is not None and shot_idx == hovered_shot_idx:
+                # Before hitting the zoom threshold, pre-decode a few hi-res frames for
+                # the hovered tile at the threshold-equivalent size.
+                threshold_scale = self.hires_decode_enabled_zoom / max(self.grid_zoom, 1e-6)
+                hinted_draw_w = max(draw_w, int(draw_w * threshold_scale))
+                hinted_draw_h = max(draw_h, int(draw_h * threshold_scale))
+                hinted_dims = self._effective_hires_dims(draw_x, draw_y, hinted_draw_w, hinted_draw_h)
+                if hinted_dims[0] > self.cell_dims[0] or hinted_dims[1] > self.cell_dims[1]:
+                    hires_bucket_count = max(1, int(shot_duration / self.hires_time_quantum) + 1)
+                    lead_depth = min(self.hires_prefetch_max_lead_frames, self.hires_cursor_hint_lead_frames)
+                    for offset in range(lead_depth):
+                        req_idx = (hires_frame_idx + offset) % hires_bucket_count
+                        visible_hires_requests.append((shot_idx, req_idx, hinted_dims))
             
             # Get frame (will use cache if available)
             frame = self.get_shot_frame(shot_idx, time_in_shot, frame_count, target_dims=target_dims)
@@ -2320,14 +2425,30 @@ class GridViewer:
                                     "shot_indices": self.selected_shot_indices[:],
                                     "start_position": self.selected_shot_indices.index(shot_idx),
                                 }
+                                menu_items = [
+                                    menu_label,
+                                    "Export clips (no re-encode)",
+                                    "Export clips (frame-accurate)",
+                                    "Export sequence",
+                                ]
                             else:
                                 menu_label = "View"
                                 payload = {
                                     "kind": "shot",
                                     "shot_idx": shot_idx,
                                 }
+                                menu_items = [
+                                    menu_label,
+                                    "Export clips (no re-encode)",
+                                    "Export clips (frame-accurate)",
+                                ]
 
-                            menu = ContextMenu(event.pos[0], event.pos[1], [menu_label], payload)
+                            menu = ContextMenu(
+                                event.pos[0],
+                                event.pos[1],
+                                menu_items,
+                                payload,
+                            )
                             menu.clamp_to_screen(self.window_width, self.window_height)
                             self._context_menu = menu
                     elif event.button == 1:  # left-click
@@ -2336,19 +2457,36 @@ class GridViewer:
                             if item_idx is None:
                                 # Click outside menu — dismiss
                                 self._context_menu = None
-                            elif item_idx == 0:  # "View"
+                            else:
                                 payload = self._context_menu.payload
+                                selected_item = self._context_menu.items[item_idx]
                                 self._context_menu = None
-                                if payload["kind"] == "sequence":
+                                if selected_item.startswith("View"):
+                                    if payload["kind"] == "sequence":
+                                        shot_indices = cast(List[int], payload["shot_indices"])
+                                        start_position = cast(int, payload["start_position"])
+                                        self._open_sequence_viewer(
+                                            shot_indices,
+                                            start_position,
+                                        )
+                                    else:
+                                        shot_idx = cast(int, payload["shot_idx"])
+                                        self._open_shot_viewer(shot_idx)
+                                elif selected_item == "Export clips (no re-encode)":
+                                    if payload["kind"] == "sequence":
+                                        shot_indices = cast(List[int], payload["shot_indices"])
+                                    else:
+                                        shot_indices = [cast(int, payload["shot_idx"])]
+                                    self._export_clips(shot_indices)
+                                elif selected_item == "Export clips (frame-accurate)":
+                                    if payload["kind"] == "sequence":
+                                        shot_indices = cast(List[int], payload["shot_indices"])
+                                    else:
+                                        shot_indices = [cast(int, payload["shot_idx"])]
+                                    self._export_clips_frame_accurate(shot_indices)
+                                elif selected_item == "Export sequence" and payload["kind"] == "sequence":
                                     shot_indices = cast(List[int], payload["shot_indices"])
-                                    start_position = cast(int, payload["start_position"])
-                                    self._open_sequence_viewer(
-                                        shot_indices,
-                                        start_position,
-                                    )
-                                else:
-                                    shot_idx = cast(int, payload["shot_idx"])
-                                    self._open_shot_viewer(shot_idx)
+                                    self._export_sequence(shot_indices)
                         elif self._sequence_viewer is not None:
                             sv = self._sequence_viewer
                             if sv.close_btn_rect.collidepoint(event.pos):
@@ -2550,6 +2688,445 @@ class GridViewer:
         if self.verbose:
             print(f"[ShotViewer] Opening shot {shot_idx + 1} ({start_time:.2f}s – {end_time:.2f}s)", flush=True)
 
+    def _choose_export_directory(self) -> Optional[Path]:
+        """Open a directory picker and return selected output folder.
+
+        Linux-first strategy:
+        1) Use native dialogs (zenity/kdialog) to avoid toolkit conflicts with Pygame.
+        2) Fall back to Tk only if native tools are unavailable.
+        """
+        initial_dir = str(self.video_path.parent)
+
+        zenity_path = shutil.which("zenity")
+        if zenity_path is not None:
+            cmd = [
+                zenity_path,
+                "--file-selection",
+                "--directory",
+                "--title=Select directory for exported clips",
+                f"--filename={initial_dir}{os.sep}",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                selected = result.stdout.strip()
+                return Path(selected) if selected else None
+            if result.returncode not in (1,):
+                err = result.stderr.strip().splitlines()
+                tail = err[-1] if err else "unknown zenity error"
+                print(f"[Export clips] zenity failed: {tail}", flush=True)
+
+        kdialog_path = shutil.which("kdialog")
+        if kdialog_path is not None:
+            cmd = [
+                kdialog_path,
+                "--getexistingdirectory",
+                initial_dir,
+                "--title",
+                "Select directory for exported clips",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                selected = result.stdout.strip()
+                return Path(selected) if selected else None
+            if result.returncode not in (1,):
+                err = result.stderr.strip().splitlines()
+                tail = err[-1] if err else "unknown kdialog error"
+                print(f"[Export clips] kdialog failed: {tail}", flush=True)
+
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except Exception as e:
+            print(f"[Export clips] Could not open directory picker: {e}", flush=True)
+            return None
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            # Respect display DPI so fallback dialogs are not tiny on HiDPI setups.
+            try:
+                dpi = float(root.winfo_fpixels("1i"))
+                if dpi > 0:
+                    root.tk.call("tk", "scaling", dpi / 72.0)
+            except Exception:
+                pass
+            try:
+                root.attributes("-topmost", True)
+            except Exception:
+                pass
+
+            selected = filedialog.askdirectory(
+                title="Select directory for exported clips",
+                initialdir=initial_dir,
+                mustexist=True,
+                parent=root,
+            )
+        except Exception as e:
+            print(f"[Export clips] Directory picker failed: {e}", flush=True)
+            selected = ""
+        finally:
+            root.destroy()
+
+        if not selected:
+            return None
+        return Path(selected)
+
+    def _clip_output_path(self, output_dir: Path, shot_idx: int) -> Path:
+        """Return output filename using source#N.ext convention (1-based shot index)."""
+        source_name = self.video_path.name
+        source_path = Path(source_name)
+        shot_number = shot_idx + 1
+        if source_path.suffix:
+            return output_dir / f"{source_path.stem}#{shot_number}{source_path.suffix}"
+        return output_dir / f"{source_name}#{shot_number}"
+
+    def _set_export_status(self, status: str) -> None:
+        """Update short export status text shown in HUD."""
+        with self._export_status_lock:
+            self._export_status = status
+
+    def _get_export_status(self) -> str:
+        """Read current export status text."""
+        with self._export_status_lock:
+            return self._export_status
+
+    def _is_export_running(self) -> bool:
+        """Return True when an export thread is active."""
+        return self._export_thread is not None and self._export_thread.is_alive()
+
+    def _start_export_task(self, label: str, task: Callable[[], None]) -> bool:
+        """Run a potentially long export task off the UI thread."""
+        if self._is_export_running():
+            print("[Export] Another export is already running.", flush=True)
+            self._set_export_status("Export busy")
+            return False
+
+        def _runner() -> None:
+            self._set_export_status(f"{label} in progress")
+            try:
+                task()
+            except Exception as e:
+                print(f"[{label}] Failed: {e}", flush=True)
+                self._set_export_status(f"{label} failed")
+                return
+            # If worker did not publish a final state, mark completion.
+            if self._get_export_status() == f"{label} in progress":
+                self._set_export_status(f"{label} complete")
+
+        self._export_thread = threading.Thread(target=_runner, daemon=True)
+        self._export_thread.start()
+        return True
+
+    def _choose_export_file_path(self, default_filename: str) -> Optional[Path]:
+        """Open a save-file picker and return selected output file path."""
+        initial_dir = str(self.video_path.parent)
+        initial_path = str(Path(initial_dir) / default_filename)
+
+        zenity_path = shutil.which("zenity")
+        if zenity_path is not None:
+            cmd = [
+                zenity_path,
+                "--file-selection",
+                "--save",
+                "--confirm-overwrite",
+                "--title=Save exported sequence as",
+                f"--filename={initial_path}",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                selected = result.stdout.strip()
+                return Path(selected) if selected else None
+            if result.returncode not in (1,):
+                err = result.stderr.strip().splitlines()
+                tail = err[-1] if err else "unknown zenity error"
+                print(f"[Export sequence] zenity failed: {tail}", flush=True)
+
+        kdialog_path = shutil.which("kdialog")
+        if kdialog_path is not None:
+            cmd = [
+                kdialog_path,
+                "--getsavefilename",
+                initial_path,
+                "--title",
+                "Save exported sequence as",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                selected = result.stdout.strip()
+                return Path(selected) if selected else None
+            if result.returncode not in (1,):
+                err = result.stderr.strip().splitlines()
+                tail = err[-1] if err else "unknown kdialog error"
+                print(f"[Export sequence] kdialog failed: {tail}", flush=True)
+
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except Exception as e:
+            print(f"[Export sequence] Could not open save-file picker: {e}", flush=True)
+            return None
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            try:
+                dpi = float(root.winfo_fpixels("1i"))
+                if dpi > 0:
+                    root.tk.call("tk", "scaling", dpi / 72.0)
+            except Exception:
+                pass
+            try:
+                root.attributes("-topmost", True)
+            except Exception:
+                pass
+
+            selected = filedialog.asksaveasfilename(
+                title="Save exported sequence as",
+                initialdir=initial_dir,
+                initialfile=default_filename,
+                parent=root,
+                defaultextension=self.video_path.suffix or ".mp4",
+                filetypes=[
+                    ("Video files", "*.mp4 *.mkv *.mov *.avi *.webm"),
+                    ("All files", "*.*"),
+                ],
+            )
+        except Exception as e:
+            print(f"[Export sequence] Save-file picker failed: {e}", flush=True)
+            selected = ""
+        finally:
+            root.destroy()
+
+        if not selected:
+            return None
+        return Path(selected)
+
+    def _export_clips(self, shot_indices: List[int]) -> None:
+        """Launch background export for selected shots (no re-encode stream copy)."""
+        if not shot_indices:
+            return
+
+        output_dir = self._choose_export_directory()
+        if output_dir is None:
+            if self.verbose:
+                print("[Export clips] Cancelled.", flush=True)
+            return
+
+        ordered_unique = list(dict.fromkeys(shot_indices))
+        print(
+            f"[Export clips] Exporting {len(ordered_unique)} clip(s) to {output_dir}",
+            flush=True,
+        )
+
+        self._start_export_task(
+            "Export clips",
+            lambda: self._export_clips_worker(ordered_unique, output_dir),
+        )
+
+    def _export_clips_worker(self, shot_indices: List[int], output_dir: Path) -> None:
+        """Background worker: export selected shots via ffmpeg stream copy."""
+        exported_count = 0
+        failed_count = 0
+
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is None:
+            self._set_export_status("Export clips failed")
+            print("[Export clips] ffmpeg not found in PATH.", flush=True)
+            return
+
+        try:
+            for shot_idx in shot_indices:
+                if shot_idx < 0 or shot_idx >= len(self.shot_timecodes):
+                    continue
+
+                # Export boundaries are always from scenedetect shot_timecodes.
+                scene_start_time, scene_end_time = self.shot_timecodes[shot_idx]
+                duration = scene_end_time - scene_start_time
+                if duration <= 0:
+                    continue
+
+                output_path = self._clip_output_path(output_dir, shot_idx)
+                try:
+                    # Use stream copy to preserve source-encoded quality without re-encoding.
+                    # Note: stream copy cuts can be keyframe-bound on some sources.
+                    cmd = [
+                        ffmpeg_path,
+                        "-y",
+                        "-i",
+                        str(self.video_path),
+                        "-ss",
+                        f"{scene_start_time:.6f}",
+                        "-t",
+                        f"{duration:.6f}",
+                        "-map",
+                        "0:v?",
+                        "-map",
+                        "0:a?",
+                        "-c",
+                        "copy",
+                        str(output_path),
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    if result.returncode != 0:
+                        err_lines = result.stderr.strip().splitlines()
+                        detail = err_lines[-1] if err_lines else "unknown ffmpeg error"
+                        raise RuntimeError(detail)
+
+                    exported_count += 1
+                    print(f"[Export clips] Shot {shot_idx + 1} -> {output_path.name}", flush=True)
+                except Exception as e:
+                    failed_count += 1
+                    print(f"[Export clips] Shot {shot_idx + 1} failed: {e}", flush=True)
+        except Exception as e:
+            self._set_export_status("Export clips failed")
+            print(f"[Export clips] Failed: {e}", flush=True)
+            return
+
+        if failed_count > 0:
+            self._set_export_status(f"Export clips complete ({exported_count} ok, {failed_count} failed)")
+        else:
+            self._set_export_status(f"Export clips complete ({exported_count} clips)")
+
+    def _export_clips_frame_accurate(self, shot_indices: List[int]) -> None:
+        """Launch background export for selected shots with frame-accurate re-encode."""
+        if not shot_indices:
+            return
+
+        output_dir = self._choose_export_directory()
+        if output_dir is None:
+            if self.verbose:
+                print("[Export clips frame-accurate] Cancelled.", flush=True)
+            return
+
+        ordered_unique = list(dict.fromkeys(shot_indices))
+        print(
+            f"[Export clips frame-accurate] Exporting {len(ordered_unique)} clip(s) to {output_dir}",
+            flush=True,
+        )
+
+        self._start_export_task(
+            "Export clips frame-accurate",
+            lambda: self._export_clips_frame_accurate_worker(ordered_unique, output_dir),
+        )
+
+    def _export_clips_frame_accurate_worker(self, shot_indices: List[int], output_dir: Path) -> None:
+        """Background worker: export selected shots via MoviePy write_videofile."""
+        exported_count = 0
+        failed_count = 0
+
+        try:
+            for shot_idx in shot_indices:
+                if shot_idx < 0 or shot_idx >= len(self.shot_timecodes):
+                    continue
+
+                scene_start_time, scene_end_time = self.shot_timecodes[shot_idx]
+                if scene_end_time <= scene_start_time:
+                    continue
+
+                output_path = self._clip_output_path(output_dir, shot_idx)
+                source_clip: Optional[VideoFileClip] = None
+                shot_clip: Optional[VideoFileClip] = None
+                try:
+                    source_clip = VideoFileClip(str(self.video_path))
+                    shot_clip = source_clip.subclipped(scene_start_time, scene_end_time)
+                    if shot_clip is None:
+                        raise RuntimeError("Failed to create subclip")
+                    shot_clip.write_videofile(str(output_path), logger=None)
+                    exported_count += 1
+                    print(
+                        f"[Export clips frame-accurate] Shot {shot_idx + 1} -> {output_path.name}",
+                        flush=True,
+                    )
+                except Exception as e:
+                    failed_count += 1
+                    print(f"[Export clips frame-accurate] Shot {shot_idx + 1} failed: {e}", flush=True)
+                finally:
+                    if shot_clip is not None:
+                        shot_clip.close()
+                    if source_clip is not None:
+                        source_clip.close()
+        except Exception as e:
+            self._set_export_status("Export clips frame-accurate failed")
+            print(f"[Export clips frame-accurate] Failed: {e}", flush=True)
+            return
+
+        if failed_count > 0:
+            self._set_export_status(
+                f"Export clips frame-accurate complete ({exported_count} ok, {failed_count} failed)"
+            )
+        else:
+            self._set_export_status(f"Export clips frame-accurate complete ({exported_count} clips)")
+
+    def _export_sequence(self, shot_indices: List[int]) -> None:
+        """Launch background export for selected shots as one sequence clip."""
+        if not shot_indices:
+            return
+
+        ordered_unique = list(dict.fromkeys(shot_indices))
+        source_path = Path(self.video_path.name)
+        default_name = (
+            f"{source_path.stem}#sequence{source_path.suffix}"
+            if source_path.suffix
+            else f"{source_path.name}#sequence"
+        )
+        output_path = self._choose_export_file_path(default_name)
+        if output_path is None:
+            if self.verbose:
+                print("[Export sequence] Cancelled.", flush=True)
+            return
+
+        print(
+            f"[Export sequence] Exporting {len(ordered_unique)} clip(s) to {output_path}",
+            flush=True,
+        )
+
+        self._start_export_task(
+            "Export sequence",
+            lambda: self._export_sequence_worker(ordered_unique, output_path),
+        )
+
+    def _export_sequence_worker(self, shot_indices: List[int], output_path: Path) -> None:
+        """Background worker: compose and export one sequence clip."""
+
+        source_clips: List[VideoFileClip] = []
+        sequence_parts: List[VideoFileClip] = []
+        sequence_clip = None
+        try:
+            for shot_idx in shot_indices:
+                if shot_idx < 0 or shot_idx >= len(self.shot_timecodes):
+                    continue
+
+                scene_start_time, scene_end_time = self.shot_timecodes[shot_idx]
+                if scene_end_time <= scene_start_time:
+                    continue
+
+                source_clip = VideoFileClip(str(self.video_path))
+                part_clip = source_clip.subclipped(scene_start_time, scene_end_time)
+                source_clips.append(source_clip)
+                sequence_parts.append(part_clip)
+
+            if not sequence_parts:
+                print("[Export sequence] No valid clips to export.", flush=True)
+                self._set_export_status("Export sequence failed")
+                return
+
+            sequence_clip = concatenate_videoclips(sequence_parts, method="compose")
+            if sequence_clip is None:
+                raise RuntimeError("Failed to compose sequence clip")
+            sequence_clip.write_videofile(str(output_path), logger=None)
+            print(f"[Export sequence] Done -> {output_path.name}", flush=True)
+            self._set_export_status("Export sequence complete")
+        except Exception as e:
+            self._set_export_status("Export sequence failed")
+            print(f"[Export sequence] Failed: {e}", flush=True)
+        finally:
+            if sequence_clip is not None:
+                sequence_clip.close()
+            for part in sequence_parts:
+                part.close()
+            for source in source_clips:
+                source.close()
+
     def _open_sequence_viewer(self, shot_indices: List[int], start_position: int = 0) -> None:
         """Open a video-only viewer for the selected shots in sequence."""
         self._close_active_viewer()
@@ -2745,8 +3322,10 @@ class GridViewer:
         hover_text = f"S{hovered_shot}" if hovered_shot is not None else "-"
         selected_text = str(len(self.selected_shot_indices))
         zoom_text = f"{self.grid_zoom:.2f}x"
+        export_status = self._get_export_status()
+        export_suffix = f" | {export_status}" if export_status else ""
         text = font.render(
-            f"{status} | {self.current_time:.1f}s / {self.max_duration:.1f}s | Hover: {hover_text} | Selected: {selected_text} | Zoom: {zoom_text} | Q=quit SPACE=pause BACKSPACE=clear",
+            f"{status} | {self.current_time:.1f}s / {self.max_duration:.1f}s | Hover: {hover_text} | Selected: {selected_text} | Zoom: {zoom_text} | Q=quit SPACE=pause BACKSPACE=clear{export_suffix}",
             True,
             (255, 255, 255)
         )
