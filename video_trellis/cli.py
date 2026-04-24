@@ -11,7 +11,11 @@ from moviepy import VideoFileClip
 from scenedetect import detect, AdaptiveDetector
 import numpy as np
 
-from video_trellis.grid_viewer import view_grid
+try:
+    from video_trellis.grid_viewer import view_grid
+except ModuleNotFoundError:
+    # Support direct script execution: `uv run video_trellis/cli.py`
+    from grid_viewer import view_grid
 
 # Suppress MoviePy warnings about reading last frames of split videos
 warnings.filterwarnings("ignore", message=".*bytes wanted but 0 bytes read.*")
@@ -194,7 +198,7 @@ def small_multiples(
     return best_dims, best_layout, pad_x, pad_y
 
 
-@app.command()
+@app.command("encode")
 def main(
     video_file_paths: list[Path] = typer.Option(
         ...,
@@ -534,7 +538,7 @@ def main(
     print("\nDone!")
 
 
-@app.command()
+@app.command("view")
 def view_grid_cmd(
     video_file: Path = typer.Option(
         ...,

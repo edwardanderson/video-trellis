@@ -10,30 +10,45 @@ G. B. Instructional. (1950). Colour in Clay. British Council. https://film.briti
 
 ## CLI
 
-### Encode Grid Video (Original Mode)
+### Encode
 
-Create an encoded video file with scenes arranged in a grid:
+Create a new video file with scenes arranged in a grid:
 
 ```bash
-video-trellis --input path/to/file --loop-clips --resolution 2048x1080 --output path/to/outfile
+video-trellis encode --input path/to/file --loop-clips --resolution 2048x1080 --output path/to/outfile
 ```
 
-### View Grid Interactively (No Re-encoding)
+### View
 
 View all scenes in an interactive grid without encoding:
 
 ```bash
-# First, generate a scene manifest with pyscenedetect
-uv run scenedetect -i video.mp4 detect-adaptive list-scenes -f shots.csv
-
-# Then, view in the grid viewer
-uv run python3 -m video_trellis.cli view-grid-cmd --input video.mp4 --manifest shots.csv
+video-trellis view --input /path/to/video.mp4
 ```
 
-The grid viewer:
-- **No re-encoding**: Dynamically reads and resizes frames in real-time
-- **Fast startup**: Starts playing immediately without encoding delay
-- **Interactive**: Play/pause, seek, and navigate through scenes
-- **Smart layout**: Automatically calculates optimal grid dimensions
+Optionally persist the `pyscenedetect` manifest:
 
-See [GRID_VIEWER.md](GRID_VIEWER.md) for detailed grid viewer documentation.
+```bash
+uv run scenedetect -i /path/to/video.mp4 detect-adaptive list-scenes -f shots.csv
+
+# Then, view in the grid viewer
+video-trellis view --input /path/to/video.mp4 --manifest shots.csv
+```
+
+Optionally render subtitles:
+
+```bash
+video-trellis view --input /path/to/video.mp4 --srt /path/to/subtitles.srt
+```
+
+#### UI
+
+- double click to snap to a clip
+- single click to select a clip
+- right click for preview and export options for the selected clip(s)
+- toggle subtitles on/off with `s`
+- backspace deselects all selected clips
+- `0` snaps to max zoom out
+- zoom in/out with `+` / `-` or mouse
+- `ESC` or `q` to exit
+

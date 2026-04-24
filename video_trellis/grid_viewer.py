@@ -25,6 +25,33 @@ import numpy as np
 from moviepy import VideoFileClip, concatenate_videoclips
 from PIL import Image
 
+try:
+    from proglog import ProgressBarLogger
+except Exception:
+    ProgressBarLogger = None
+
+
+if ProgressBarLogger is not None:
+    class _ExportProgressLogger(ProgressBarLogger):
+        """MoviePy/proglog adapter that reports normalized export progress."""
+
+        def __init__(self, on_progress: Callable[[float], None]):
+            super().__init__()
+            self._on_progress = on_progress
+
+        def bars_callback(self, bar, attr, value, old_value=None):
+            super().bars_callback(bar, attr, value, old_value)
+            if bar != "t":
+                return
+            bar_state = self.bars.get(bar, {})
+            total = float(bar_state.get("total") or 0.0)
+            index = float(bar_state.get("index") or 0.0)
+            if total <= 0.0:
+                return
+            # proglog index is often 0-based and may stop at total-1.
+            progress = max(0.0, min(1.0, (index + 1.0) / total))
+            self._on_progress(progress)
+
 RESAMPLE_BILINEAR = Image.Resampling.BILINEAR
 
 try:
@@ -1127,6 +1154,7 @@ class GridViewer:
         self._export_thread: Optional[threading.Thread] = None
         self._export_status_lock = threading.Lock()
         self._export_status: str = ""
+        self._export_progress: Optional[float] = None
         self._resize_pending_size: Optional[Tuple[int, int]] = None
         self._resize_last_event_ts: float = 0.0
         self._resize_settle_seconds: float = 0.25
@@ -2899,10 +2927,23 @@ class GridViewer:
         with self._export_status_lock:
             self._export_status = status
 
+    def _set_export_progress(self, progress: Optional[float]) -> None:
+        """Update export progress ratio in [0, 1] for HUD progress bar."""
+        with self._export_status_lock:
+            if progress is None:
+                self._export_progress = None
+                return
+            self._export_progress = max(0.0, min(1.0, float(progress)))
+
     def _get_export_status(self) -> str:
         """Read current export status text."""
         with self._export_status_lock:
             return self._export_status
+
+    def _get_export_progress(self) -> Optional[float]:
+        """Read current export progress ratio."""
+        with self._export_status_lock:
+            return self._export_progress
 
     def _is_export_running(self) -> bool:
         """Return True when an export thread is active."""
@@ -2917,15 +2958,18 @@ class GridViewer:
 
         def _runner() -> None:
             self._set_export_status(f"{label} in progress")
+            self._set_export_progress(0.0)
             try:
                 task()
             except Exception as e:
                 print(f"[{label}] Failed: {e}", flush=True)
                 self._set_export_status(f"{label} failed")
+                self._set_export_progress(None)
                 return
             # If worker did not publish a final state, mark completion.
             if self._get_export_status() == f"{label} in progress":
                 self._set_export_status(f"{label} complete")
+            self._set_export_progress(None)
 
         self._export_thread = threading.Thread(target=_runner, daemon=True)
         self._export_thread.start()
@@ -3127,14 +3171,19 @@ class GridViewer:
         """Background worker: export selected shots via MoviePy write_videofile."""
         exported_count = 0
         failed_count = 0
+        total_shots = max(1, len(shot_indices))
 
         try:
-            for shot_idx in shot_indices:
+            for shot_position, shot_idx in enumerate(shot_indices, start=1):
+                clip_base = (shot_position - 1) / total_shots
+                self._set_export_progress(clip_base)
                 if shot_idx < 0 or shot_idx >= len(self.shot_timecodes):
+                    self._set_export_progress(shot_position / total_shots)
                     continue
 
                 scene_start_time, scene_end_time = self.shot_timecodes[shot_idx]
                 if scene_end_time <= scene_start_time:
+                    self._set_export_progress(shot_position / total_shots)
                     continue
 
                 output_path = self._clip_output_path(output_dir, shot_idx)
@@ -3145,7 +3194,14 @@ class GridViewer:
                     shot_clip = source_clip.subclipped(scene_start_time, scene_end_time)
                     if shot_clip is None:
                         raise RuntimeError("Failed to create subclip")
-                    shot_clip.write_videofile(str(output_path), logger=None)
+                    logger = None
+                    if ProgressBarLogger is not None:
+                        logger = _ExportProgressLogger(
+                            lambda local_progress, base=clip_base, denom=total_shots: self._set_export_progress(
+                                base + (local_progress / denom)
+                            )
+                        )
+                    shot_clip.write_videofile(str(output_path), logger=logger)
                     exported_count += 1
                     print(
                         f"[Export clips frame-accurate] Shot {shot_idx + 1} -> {output_path.name}",
@@ -3155,6 +3211,7 @@ class GridViewer:
                     failed_count += 1
                     print(f"[Export clips frame-accurate] Shot {shot_idx + 1} failed: {e}", flush=True)
                 finally:
+                    self._set_export_progress(shot_position / total_shots)
                     if shot_clip is not None:
                         shot_clip.close()
                     if source_clip is not None:
@@ -3169,6 +3226,7 @@ class GridViewer:
                 f"Export clips frame-accurate complete ({exported_count} ok, {failed_count} failed)"
             )
         else:
+            self._set_export_progress(1.0)
             self._set_export_status(f"Export clips frame-accurate complete ({exported_count} clips)")
 
     def _export_sequence(self, shot_indices: List[int]) -> None:
@@ -3206,19 +3264,25 @@ class GridViewer:
         source_clips: List[VideoFileClip] = []
         sequence_parts: List[VideoFileClip] = []
         sequence_clip = None
+        total_shots = max(1, len(shot_indices))
         try:
-            for shot_idx in shot_indices:
+            for shot_position, shot_idx in enumerate(shot_indices, start=1):
+                # Reserve first 25% of bar for subclip preparation.
+                self._set_export_progress(0.25 * ((shot_position - 1) / total_shots))
                 if shot_idx < 0 or shot_idx >= len(self.shot_timecodes):
+                    self._set_export_progress(0.25 * (shot_position / total_shots))
                     continue
 
                 scene_start_time, scene_end_time = self.shot_timecodes[shot_idx]
                 if scene_end_time <= scene_start_time:
+                    self._set_export_progress(0.25 * (shot_position / total_shots))
                     continue
 
                 source_clip = VideoFileClip(str(self.video_path))
                 part_clip = source_clip.subclipped(scene_start_time, scene_end_time)
                 source_clips.append(source_clip)
                 sequence_parts.append(part_clip)
+                self._set_export_progress(0.25 * (shot_position / total_shots))
 
             if not sequence_parts:
                 print("[Export sequence] No valid clips to export.", flush=True)
@@ -3228,7 +3292,14 @@ class GridViewer:
             sequence_clip = concatenate_videoclips(sequence_parts, method="compose")
             if sequence_clip is None:
                 raise RuntimeError("Failed to compose sequence clip")
-            sequence_clip.write_videofile(str(output_path), logger=None)
+            logger = None
+            if ProgressBarLogger is not None:
+                # Reserve remaining 75% for encoder progress.
+                logger = _ExportProgressLogger(
+                    lambda local_progress: self._set_export_progress(0.25 + (0.75 * local_progress))
+                )
+            sequence_clip.write_videofile(str(output_path), logger=logger)
+            self._set_export_progress(1.0)
             print(f"[Export sequence] Done -> {output_path.name}", flush=True)
             self._set_export_status("Export sequence complete")
         except Exception as e:
@@ -3459,6 +3530,8 @@ class GridViewer:
     def _clamp_grid_offset(self) -> None:
         """Clamp pan offsets so the grid stays within sensible viewport bounds."""
         base = self._grid_base_rect()
+        scaled_base_x = base.x * self.grid_zoom
+        scaled_base_y = base.y * self.grid_zoom
         scaled_w = base.width * self.grid_zoom
         scaled_h = base.height * self.grid_zoom
 
@@ -3474,15 +3547,15 @@ class GridViewer:
         if scaled_w <= self.window_width:
             self.grid_offset_x = 0.0
         else:
-            min_offset_x = self.window_width - base.x - scaled_w - overscroll_x
-            max_offset_x = -base.x + overscroll_x
+            min_offset_x = self.window_width - scaled_base_x - scaled_w - overscroll_x
+            max_offset_x = -scaled_base_x + overscroll_x
             self.grid_offset_x = max(min_offset_x, min(max_offset_x, self.grid_offset_x))
 
         if scaled_h <= self.window_height:
             self.grid_offset_y = 0.0
         else:
-            min_offset_y = self.window_height - base.y - scaled_h - overscroll_y
-            max_offset_y = -base.y + overscroll_y
+            min_offset_y = self.window_height - scaled_base_y - scaled_h - overscroll_y
+            max_offset_y = -scaled_base_y + overscroll_y
             self.grid_offset_y = max(min_offset_y, min(max_offset_y, self.grid_offset_y))
 
     def _pan_grid(self, dx: float, dy: float) -> None:
@@ -3540,12 +3613,14 @@ class GridViewer:
     def _render_hud(self):
         """Render heads-up display with playback info."""
         font = pygame.font.Font(None, 24)
+        small_font = pygame.font.Font(None, 20)
         status = "PLAYING" if self.playing else "PAUSED"
         hovered_shot = self._hovered_shot_number()
         hover_text = f"S{hovered_shot}" if hovered_shot is not None else "-"
         selected_text = str(len(self.selected_shot_indices))
         zoom_text = f"{self.grid_zoom:.2f}x"
         export_status = self._get_export_status()
+        export_progress = self._get_export_progress()
         export_suffix = f" | {export_status}" if export_status else ""
         text = font.render(
             f"{status} | {self.current_time:.1f}s / {self.max_duration:.1f}s | Hover: {hover_text} | Selected: {selected_text} | Zoom: {zoom_text} | Q=quit SPACE=pause BACKSPACE=clear{export_suffix}",
@@ -3553,6 +3628,19 @@ class GridViewer:
             (255, 255, 255)
         )
         self.display.blit(text, (10, 10))
+
+        if self._is_export_running() and export_progress is not None:
+            bar_x = 10
+            bar_y = 36
+            bar_w = min(420, max(180, self.window_width - 20))
+            bar_h = 10
+            pygame.draw.rect(self.display, (45, 45, 45), (bar_x, bar_y, bar_w, bar_h), border_radius=3)
+            fill_w = int(bar_w * export_progress)
+            if fill_w > 0:
+                pygame.draw.rect(self.display, (70, 200, 120), (bar_x, bar_y, fill_w, bar_h), border_radius=3)
+            pygame.draw.rect(self.display, (180, 180, 180), (bar_x, bar_y, bar_w, bar_h), width=1, border_radius=3)
+            pct_label = small_font.render(f"{int(export_progress * 100):d}%", True, (220, 220, 220))
+            self.display.blit(pct_label, (bar_x + bar_w + 8, bar_y - 3))
 
 
 def view_grid(
