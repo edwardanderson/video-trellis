@@ -30,8 +30,7 @@ Optionally persist the `pyscenedetect` manifest:
 
 ```bash
 uv run scenedetect -i /path/to/video.mp4 detect-adaptive list-scenes -f shots.csv
-
-# Then, view in the grid viewer
+# Use `--manifest` to pass the shotlist
 video-trellis view --input /path/to/video.mp4 --manifest shots.csv
 ```
 
@@ -51,4 +50,3 @@ video-trellis view --input /path/to/video.mp4 --srt /path/to/subtitles.srt
 - `0` snaps to max zoom out
 - zoom in/out with `+` / `-` or mouse
 - `ESC` or `q` to exit
-
