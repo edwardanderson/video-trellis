@@ -924,6 +924,7 @@ class GridViewer:
         fps: Optional[int] = None,
         allow_padding: bool = True,
         fullscreen: bool = False,
+        maximized: bool = False,
         verbose: bool = False,
         subtitle_path: Optional[Path] = None,
     ):
@@ -953,6 +954,7 @@ class GridViewer:
         self.window_height = window_height
         self.allow_padding = allow_padding
         self.fullscreen = fullscreen
+        self.maximized = maximized
         self.verbose = verbose
 
         # Subtitle support
@@ -976,12 +978,23 @@ class GridViewer:
         
         # Pygame setup
         pygame.init()
+        self._display_flags = 0
         if self.fullscreen:
-            self.display = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+            self._display_flags = pygame.FULLSCREEN
+            self.display = pygame.display.set_mode((0, 0), self._display_flags)
             self.window_width, self.window_height = self.display.get_size()
         else:
-            self.display = pygame.display.set_mode((window_width, window_height))
-        pygame.display.set_caption(f"Video Grid Viewer - {video_path.name}")
+            self._display_flags = pygame.RESIZABLE
+            self.display = pygame.display.set_mode((window_width, window_height), self._display_flags)
+            if self.maximized:
+                # Best-effort maximize on pygame2/SDL2 backends.
+                try:
+                    from pygame._sdl2 import Window
+                    Window.from_display_module().maximize()
+                    self.window_width, self.window_height = self.display.get_size()
+                except Exception:
+                    pass
+        pygame.display.set_caption(f"Video Trellis Viewer - {video_path.name}")
         self.clock = pygame.time.Clock()
 
         # Calculate grid layout
@@ -1040,7 +1053,10 @@ class GridViewer:
         hires_target_quantum = min(self.cache_time_quantum, 1.0 / max(float(self.fps), 1.0))
         self.hires_frame_buffer_max_per_shot = max(120, int(math.ceil(6.0 / hires_target_quantum)))
         # Hi-res decode is background-only to keep the UI thread responsive.
-        self.hires_decode_enabled_zoom = 1.25
+        self.hires_decode_enabled_zoom_base = 1.25
+        self.hires_decode_enabled_zoom_min = 1.05
+        self.hires_decode_enabled_zoom_max = 1.35
+        self.hires_decode_reference_cell_pixels = 160_000
         self.hires_decode_overscan = 1.35
         self.hires_decode_max_pixels = 3_145_728  # ~2048x1536 max per visible tile
         self.hires_fullres_viewport_threshold = 0.80
@@ -1111,10 +1127,16 @@ class GridViewer:
         self._export_thread: Optional[threading.Thread] = None
         self._export_status_lock = threading.Lock()
         self._export_status: str = ""
+        self._resize_pending_size: Optional[Tuple[int, int]] = None
+        self._resize_last_event_ts: float = 0.0
+        self._resize_settle_seconds: float = 0.25
+        self._last_left_click_ts: float = 0.0
+        self._last_left_click_shot_idx: Optional[int] = None
+        self._double_click_seconds: float = 0.30
 
         # Grid zoom state (applies only to the background shot grid).
         self.grid_zoom = 1.0
-        self.grid_zoom_min = 0.6
+        self.grid_zoom_min = 1.0
         # Allow zooming until a single cell fills the screen edge-to-edge on at least one axis.
         cell_w, cell_h = self.cell_dims
         self.grid_zoom_max = max(
@@ -1125,6 +1147,11 @@ class GridViewer:
         self.grid_offset_y = 0.0
         self.pan_pixels_per_second = 900.0
         self.edge_pan_margin = 28
+        # Allow a small overscroll when zoomed-in so edge tile content can be
+        # brought fully into view instead of hard-clamping exactly at grid bounds.
+        self.pan_overscroll_fraction = 0.08
+        self.pan_overscroll_min_px = 40
+        self.pan_overscroll_max_px = 220
 
         # Warmup progress (updated by background thread, read by render loop)
         self._warmup_progress: int = 0   # frames decoded so far
@@ -1367,7 +1394,8 @@ class GridViewer:
                     visible_shots = list(self._visible_shot_indices)
                     visible_weights = dict(self._visible_shot_weights)
 
-                if self.grid_zoom >= self.hires_decode_enabled_zoom and visible_shots:
+                hires_zoom_threshold = self._current_hires_decode_enabled_zoom()
+                if self.grid_zoom >= hires_zoom_threshold and visible_shots:
                     # At high zoom, focus base prefetch on what is actually visible.
                     visible_unique = self._ordered_visible_shots(visible_shots, visible_weights)
                     local_count = len(visible_unique)
@@ -1538,7 +1566,7 @@ class GridViewer:
                             seen_reqs.add(req)
                             deduped.append(req)
                         ordered = deduped
-                        if self.grid_zoom >= self.hires_decode_enabled_zoom:
+                        if self.grid_zoom >= hires_zoom_threshold:
                             hires_budget = self._hires_budget_for_visibility(len(ordered), visible_weights)
                             visible_count = max(1, len(visible_weights))
                             if visible_count <= 2:
@@ -1779,6 +1807,20 @@ class GridViewer:
             return min(self.hires_prefetch_max_lead_frames, 4)
         return min(self.hires_prefetch_max_lead_frames, 2)
 
+    def _current_hires_decode_enabled_zoom(self) -> float:
+        """Return adaptive zoom threshold for enabling hi-res decode.
+
+        Smaller base tiles (common in smaller windows) switch to hi-res decode earlier
+        to avoid long periods of visibly low-quality upscale.
+        """
+        cell_area = max(1, self.cell_dims[0] * self.cell_dims[1])
+        ref_area = max(1, self.hires_decode_reference_cell_pixels)
+        area_scale = math.sqrt(min(1.0, cell_area / float(ref_area)))
+        threshold = self.hires_decode_enabled_zoom_min + (
+            self.hires_decode_enabled_zoom_base - self.hires_decode_enabled_zoom_min
+        ) * area_scale
+        return max(self.hires_decode_enabled_zoom_min, min(self.hires_decode_enabled_zoom_max, threshold))
+
     def _subtitle_at(self, abs_ts: float) -> Optional[str]:
         """Return the subtitle text active at *abs_ts* seconds, or None."""
         if not self.subtitles:
@@ -1933,7 +1975,7 @@ class GridViewer:
 
     def _prune_invisible_caches(self, visible_shot_indices: List[int]) -> None:
         """Drop off-screen hi-res caches so zoomed-in playback prioritizes visible content."""
-        if self.grid_zoom < self.hires_decode_enabled_zoom:
+        if self.grid_zoom < self._current_hires_decode_enabled_zoom():
             return
 
         visible = set(visible_shot_indices)
@@ -1948,7 +1990,7 @@ class GridViewer:
         """Prune hi-res cache when zoom tier changes enough to invalidate cached size buckets."""
         # Keep hi-res cache when dipping below threshold so rapid zoom-in/out
         # does not drop back to lowest-quality placeholders.
-        if new_zoom < self.hires_decode_enabled_zoom:
+        if new_zoom < self._current_hires_decode_enabled_zoom():
             return
         if old_zoom <= 0:
             return
@@ -2249,7 +2291,8 @@ class GridViewer:
             hires_frame_idx = self._frame_idx_for_quantum(shot_idx, time_in_shot, self.hires_time_quantum)
 
             target_dims: Tuple[int, int] = self.cell_dims
-            if self.grid_zoom >= self.hires_decode_enabled_zoom:
+            hires_zoom_threshold = self._current_hires_decode_enabled_zoom()
+            if self.grid_zoom >= hires_zoom_threshold:
                 target_dims = self._effective_hires_dims(draw_x, draw_y, draw_w, draw_h)
                 if target_dims[0] > self.cell_dims[0] or target_dims[1] > self.cell_dims[1]:
                     coverage = visible_pixels / float(viewport_pixels)
@@ -2261,7 +2304,7 @@ class GridViewer:
             elif hovered_shot_idx is not None and shot_idx == hovered_shot_idx:
                 # Before hitting the zoom threshold, pre-decode a few hi-res frames for
                 # the hovered tile at the threshold-equivalent size.
-                threshold_scale = self.hires_decode_enabled_zoom / max(self.grid_zoom, 1e-6)
+                threshold_scale = hires_zoom_threshold / max(self.grid_zoom, 1e-6)
                 hinted_draw_w = max(draw_w, int(draw_w * threshold_scale))
                 hinted_draw_h = max(draw_h, int(draw_h * threshold_scale))
                 hinted_dims = self._effective_hires_dims(draw_x, draw_y, hinted_draw_w, hinted_draw_h)
@@ -2357,6 +2400,50 @@ class GridViewer:
 
         pygame.display.flip()
 
+    def _render_resize_screen(self, pending_size: Tuple[int, int]) -> None:
+        """Draw a lightweight screen while waiting for resize to settle."""
+        sw, sh = self.window_width, self.window_height
+        self.display.fill((10, 10, 10))
+        font_large = pygame.font.Font(None, 42)
+        font_small = pygame.font.Font(None, 26)
+
+        title = font_large.render("Resizing window...", True, (210, 210, 210))
+        detail = font_small.render(
+            f"Release to apply: {pending_size[0]}x{pending_size[1]}",
+            True,
+            (160, 160, 160),
+        )
+        self.display.blit(title, (sw // 2 - title.get_width() // 2, sh // 2 - 26))
+        self.display.blit(detail, (sw // 2 - detail.get_width() // 2, sh // 2 + 14))
+
+    def _rewarm_caches_with_progress(self) -> bool:
+        """Run warmup and progress UI; returns False if user requested exit."""
+        self._warmup_progress = 0
+        self._warmup_total = 0
+        self._warmup_done = False
+        warmup_thread = threading.Thread(target=self._warmup_frame_caches, daemon=True)
+        warmup_thread.start()
+
+        while not self._warmup_done:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    warmup_thread.join(timeout=1.0)
+                    return False
+                if event.type == pygame.KEYDOWN and event.key in (pygame.K_q, pygame.K_ESCAPE):
+                    warmup_thread.join(timeout=1.0)
+                    return False
+                if event.type == pygame.VIDEORESIZE and not self.fullscreen:
+                    self._resize_pending_size = (event.w, event.h)
+                    self._resize_last_event_ts = time.perf_counter()
+                elif event.type == pygame.WINDOWSIZECHANGED and not self.fullscreen:
+                    self._resize_pending_size = (event.x, event.y)
+                    self._resize_last_event_ts = time.perf_counter()
+            self._render_warmup_screen()
+            self.clock.tick(30)
+
+        warmup_thread.join()
+        return True
+
     def run(self):
         """Run the interactive grid viewer."""
         if self.verbose:
@@ -2368,23 +2455,9 @@ class GridViewer:
         # Warm up caches on a background thread while showing a progress bar
         if self.verbose:
             print("Warming up frame caches...")
-        warmup_thread = threading.Thread(target=self._warmup_frame_caches, daemon=True)
-        warmup_thread.start()
-
-        while not self._warmup_done:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    warmup_thread.join(timeout=1.0)
-                    pygame.quit()
-                    return
-                if event.type == pygame.KEYDOWN and event.key in (pygame.K_q, pygame.K_ESCAPE):
-                    warmup_thread.join(timeout=1.0)
-                    pygame.quit()
-                    return
-            self._render_warmup_screen()
-            self.clock.tick(30)
-
-        warmup_thread.join()
+        if not self._rewarm_caches_with_progress():
+            pygame.quit()
+            return
 
         # Start background prefetching thread
         self._start_prefetch_thread()
@@ -2401,6 +2474,12 @@ class GridViewer:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+                elif event.type == pygame.VIDEORESIZE and not self.fullscreen:
+                    self._resize_pending_size = (event.w, event.h)
+                    self._resize_last_event_ts = time.perf_counter()
+                elif event.type == pygame.WINDOWSIZECHANGED and not self.fullscreen:
+                    self._resize_pending_size = (event.x, event.y)
+                    self._resize_last_event_ts = time.perf_counter()
                 elif event.type == pygame.MOUSEMOTION:
                     if self._context_menu is not None:
                         self._context_menu.update_hover(event.pos)
@@ -2508,8 +2587,22 @@ class GridViewer:
                             shot_idx = self._hovered_shot_index(event.pos)
                             if shot_idx is None:
                                 self.selected_shot_indices.clear()
+                                self._last_left_click_shot_idx = None
                             else:
-                                self._toggle_selected_shot(shot_idx)
+                                now = time.perf_counter()
+                                is_double_click = (
+                                    getattr(event, "clicks", 1) >= 2
+                                    or (
+                                        self._last_left_click_shot_idx == shot_idx
+                                        and (now - self._last_left_click_ts) <= self._double_click_seconds
+                                    )
+                                )
+                                self._last_left_click_ts = now
+                                self._last_left_click_shot_idx = shot_idx
+                                if is_double_click:
+                                    self._snap_shot_to_window(shot_idx)
+                                else:
+                                    self._toggle_selected_shot(shot_idx)
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         if active_viewer is not None:
@@ -2556,6 +2649,27 @@ class GridViewer:
                         self.current_time = max(0, self.current_time - 1.0)
                     elif event.key == pygame.K_RIGHT:
                         self.current_time = min(self.max_duration, self.current_time + 1.0)
+
+            # While the user is actively resizing, pause normal rendering and wait
+            # for dimensions to settle before re-applying layout and warming caches.
+            if self._resize_pending_size is not None:
+                if time.perf_counter() - self._resize_last_event_ts < self._resize_settle_seconds:
+                    self._render_resize_screen(self._resize_pending_size)
+                    pygame.display.flip()
+                    self.clock.tick(60)
+                    continue
+
+                target_w, target_h = self._resize_pending_size
+                self._resize_pending_size = None
+                self._context_menu = None
+                resized = self._handle_window_resize(target_w, target_h)
+                if resized:
+                    self._stop_prefetch_thread()
+                    if not self._rewarm_caches_with_progress():
+                        running = False
+                        continue
+                    self._start_prefetch_thread()
+                continue
 
             # Continuous panning from keyboard hold and edge-hover
             if active_viewer is None:
@@ -3064,10 +3178,11 @@ class GridViewer:
 
         ordered_unique = list(dict.fromkeys(shot_indices))
         source_path = Path(self.video_path.name)
+        shot_numbers_suffix = "-".join(str(idx + 1) for idx in ordered_unique)
         default_name = (
-            f"{source_path.stem}#sequence{source_path.suffix}"
+            f"{source_path.stem}#sequence-{shot_numbers_suffix}{source_path.suffix}"
             if source_path.suffix
-            else f"{source_path.name}#sequence"
+            else f"{source_path.name}#sequence-{shot_numbers_suffix}"
         )
         output_path = self._choose_export_file_path(default_name)
         if output_path is None:
@@ -3142,6 +3257,72 @@ class GridViewer:
         selection_label = ", ".join(f"S{idx + 1}" for idx in shot_indices)
         if self.verbose:
             print(f"[SequenceViewer] Opening selected shots: {selection_label}", flush=True)
+
+    def _clear_all_frame_caches(self) -> None:
+        """Clear base + hi-res frame caches after a geometry change."""
+        with self._cache_lock:
+            self.frame_buffer.clear()
+            self.frame_read_order.clear()
+            self.latest_ready_frame.clear()
+            self.latest_ready_idx.clear()
+            self.hires_frame_buffer.clear()
+            self.hires_frame_read_order.clear()
+            self._visible_hires_requests = []
+            self._visible_shot_indices = []
+            self._visible_shot_weights = {}
+
+    def _handle_window_resize(self, new_width: int, new_height: int) -> bool:
+        """Reconfigure window-dependent layout and caches after a resize event.
+
+        Returns True when window geometry actually changed.
+        """
+        if self.fullscreen:
+            return False
+
+        new_width = max(320, int(new_width))
+        new_height = max(240, int(new_height))
+        if new_width == self.window_width and new_height == self.window_height:
+            return False
+
+        old_cell_dims = self.cell_dims
+        old_zoom = self.grid_zoom
+
+        self.window_width = new_width
+        self.window_height = new_height
+        self.display = pygame.display.set_mode((new_width, new_height), self._display_flags)
+
+        self.cell_dims, self.layout, self.pad_x, self.pad_y = calculate_grid_layout(
+            len(self.shot_timecodes),
+            self.window_width,
+            self.window_height,
+            self.video_width,
+            self.video_height,
+            allow_padding=self.allow_padding,
+        )
+
+        cell_w, cell_h = self.cell_dims
+        self.grid_zoom_max = max(
+            self.window_width / max(1, cell_w),
+            self.window_height / max(1, cell_h),
+        )
+        self.grid_zoom = max(self.grid_zoom_min, min(self.grid_zoom_max, self.grid_zoom))
+        self._clamp_grid_offset()
+
+        self.bytes_per_cached_frame = cell_w * cell_h * 3
+        self.estimated_full_cache_bytes = self.total_bucket_frames * self.bytes_per_cached_frame
+
+        if old_cell_dims != self.cell_dims:
+            self._clear_all_frame_caches()
+            self._subtitle_overlay_cache.clear()
+            self._close_active_viewer()
+
+        self._maybe_prune_hires_cache_for_zoom(old_zoom, self.grid_zoom)
+        if self.verbose:
+            print(
+                f"[Resize] {self.window_width}x{self.window_height} | Grid {self.layout[0]}x{self.layout[1]} | Cell {self.cell_dims[0]}x{self.cell_dims[1]}",
+                flush=True,
+            )
+        return True
 
     def _close_active_viewer(self) -> None:
         """Close whichever overlay viewer is currently open."""
@@ -3218,6 +3399,39 @@ class GridViewer:
         self._clamp_grid_offset()
         self._maybe_prune_hires_cache_for_zoom(old_zoom, new_zoom)
 
+    def _snap_shot_to_window(self, shot_idx: int) -> None:
+        """Toggle zoom between shot snap target and full-grid view (1.0)."""
+        if shot_idx < 0 or shot_idx >= len(self.shot_timecodes):
+            return
+
+        old_zoom = self.grid_zoom
+
+        rows, cols = self.layout
+        cell_w, cell_h = self.cell_dims
+        row = shot_idx // cols
+        col = shot_idx % cols
+        shot_center_x = self.pad_x + col * cell_w + cell_w / 2.0
+        shot_center_y = self.pad_y + row * cell_h + cell_h / 2.0
+
+        # Snap target is the maximum zoom that still shows the complete tile.
+        snap_zoom = min(self.window_width / cell_w, self.window_height / cell_h) * 0.95
+        snap_zoom = max(self.grid_zoom_min, min(self.grid_zoom_max, snap_zoom))
+        snap_tolerance = max(0.01, snap_zoom * 0.03)
+
+        if old_zoom < (snap_zoom - snap_tolerance):
+            # Below snap target: zoom in and center clicked shot.
+            self.grid_zoom = snap_zoom
+            self.grid_offset_x = self.window_width / 2.0 - shot_center_x * snap_zoom
+            self.grid_offset_y = self.window_height / 2.0 - shot_center_y * snap_zoom
+        else:
+            # At/near (or above) snap target: return to baseline full-grid zoom.
+            self.grid_zoom = 1.0
+            self.grid_offset_x = 0.0
+            self.grid_offset_y = 0.0
+        
+        self._clamp_grid_offset()
+        self._maybe_prune_hires_cache_for_zoom(old_zoom, self.grid_zoom)
+
     def _reset_grid_zoom(self) -> None:
         """Reset grid zoom and pan offset to default view."""
         old_zoom = self.grid_zoom
@@ -3248,18 +3462,27 @@ class GridViewer:
         scaled_w = base.width * self.grid_zoom
         scaled_h = base.height * self.grid_zoom
 
+        overscroll_x = max(
+            self.pan_overscroll_min_px,
+            min(self.pan_overscroll_max_px, int(self.window_width * self.pan_overscroll_fraction)),
+        )
+        overscroll_y = max(
+            self.pan_overscroll_min_px,
+            min(self.pan_overscroll_max_px, int(self.window_height * self.pan_overscroll_fraction)),
+        )
+
         if scaled_w <= self.window_width:
             self.grid_offset_x = 0.0
         else:
-            min_offset_x = self.window_width - base.x - scaled_w
-            max_offset_x = -base.x
+            min_offset_x = self.window_width - base.x - scaled_w - overscroll_x
+            max_offset_x = -base.x + overscroll_x
             self.grid_offset_x = max(min_offset_x, min(max_offset_x, self.grid_offset_x))
 
         if scaled_h <= self.window_height:
             self.grid_offset_y = 0.0
         else:
-            min_offset_y = self.window_height - base.y - scaled_h
-            max_offset_y = -base.y
+            min_offset_y = self.window_height - base.y - scaled_h - overscroll_y
+            max_offset_y = -base.y + overscroll_y
             self.grid_offset_y = max(min_offset_y, min(max_offset_y, self.grid_offset_y))
 
     def _pan_grid(self, dx: float, dy: float) -> None:
@@ -3341,6 +3564,7 @@ def view_grid(
     fps: Optional[int] = None,
     allow_padding: bool = True,
     fullscreen: bool = False,
+    maximized: bool = False,
     verbose: bool = False,
     subtitle_path: Optional[Path] = None,
 ) -> None:
@@ -3397,6 +3621,7 @@ def view_grid(
         fps=fps,
         allow_padding=allow_padding,
         fullscreen=fullscreen,
+        maximized=maximized,
         verbose=verbose,
         subtitle_path=subtitle_path,
     )

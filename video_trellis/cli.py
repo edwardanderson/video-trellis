@@ -580,6 +580,11 @@ def view_grid_cmd(
         "--fullscreen/--windowed",
         help="Open the grid viewer in fullscreen mode",
     ),
+    maximized: bool = typer.Option(
+        False,
+        "--maximised",
+        help="Open in windowed maximized mode (ignored with --fullscreen).",
+    ),
     padding: bool = typer.Option(
         True,
         "--padding/--no-padding",
@@ -623,6 +628,7 @@ def view_grid_cmd(
                 fps=fps,
                 allow_padding=padding,
                 fullscreen=fullscreen,
+                maximized=maximized,
                 verbose=verbose,
                 subtitle_path=srt,
             )
@@ -648,6 +654,7 @@ def view_grid_cmd(
                 fps=fps,
                 allow_padding=padding,
                 fullscreen=fullscreen,
+                maximized=maximized,
                 verbose=verbose,
                 subtitle_path=srt,
             )
