@@ -1,6 +1,6 @@
 [project]
 name = "video-trellis"
-version = "0.1.0"
+version = "0.2.0"
 description = "Draw the scenes of a video as a grid of small multiples"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -8,6 +8,7 @@ dependencies = [
     "moviepy>=2.2.1",
     "scenedetect[opencv]>=0.6.7.1",
     "typer>=0.21.1",
+    "pygame>=2.5.0",
 ]
 
 [project.scripts]

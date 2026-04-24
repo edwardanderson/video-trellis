@@ -10,6 +10,45 @@ G. B. Instructional. (1950). Colour in Clay. British Council. https://film.briti
 
 ## CLI
 
+### Encode
+
+Create a new video file with scenes arranged in a grid:
+
 ```bash
-video-trellis --input path/to/file --loop-clips --resolution 2048x1080 --output path/to/outfile
+video-trellis encode --input path/to/file --loop-clips --resolution 2048x1080 --output path/to/outfile
 ```
+
+### View
+
+View all scenes in an interactive grid without encoding:
+
+```bash
+video-trellis view --input /path/to/video.mp4
+```
+
+Optionally persist the `pyscenedetect` manifest:
+
+```bash
+uv run scenedetect -i /path/to/video.mp4 detect-adaptive list-scenes -f shots.csv
+
+# Then, view in the grid viewer
+video-trellis view --input /path/to/video.mp4 --manifest shots.csv
+```
+
+Optionally render subtitles:
+
+```bash
+video-trellis view --input /path/to/video.mp4 --srt /path/to/subtitles.srt
+```
+
+#### UI
+
+- double click to snap to a clip
+- single click to select a clip
+- right click for preview and export options for the selected clip(s)
+- toggle subtitles on/off with `s`
+- backspace deselects all selected clips
+- `0` snaps to max zoom out
+- zoom in/out with `+` / `-` or mouse
+- `ESC` or `q` to exit
+

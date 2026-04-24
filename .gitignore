@@ -13,3 +13,7 @@ wheels/
 dev/
 media/
 uv.lock
+
+pysaic/
+shots.csv
+scenes/
